@@ -1,0 +1,847 @@
+#!/usr/bin/env bash
+
+# File to store the token
+TOKEN_FILE=".1nce_token"
+LOG_FILE="1nce.log"
+
+# Determine the correct command for bat/batcat
+if command -v bat &> /dev/null; then
+    BAT_CMD="bat"
+elif command -v batcat &> /dev/null; then
+    BAT_CMD="batcat"
+else
+    echo "Error: neither bat nor batcat is installed."
+    exit 1
+fi
+
+# Function to log actions
+log_action() {
+    local action=$1
+    local iccids=$2
+    local info=$3
+    local http_code=$4
+    local timestamp=$(date +"%Y-%m-%d %H:%M:%S")
+
+    # Ensure the log file exists and contais a line (else sed -i will fail silently)
+    if [ ! -f "$LOG_FILE" ]; then
+        echo "" > "$LOG_FILE"
+    fi
+
+    # If iccids is not a comma-separated list, treat it as a single ICCID, else log each ICCID separately
+    if [[ "$iccids" != *,* ]]; then
+        # Prepend the log entry to the file
+        sed -i "1i$timestamp | $action | $iccids | $info | $http_code" "$LOG_FILE"
+    else
+        IFS=',' read -r -a iccid_array <<< "$iccids"
+        for iccid in "${iccid_array[@]}"; do
+            sed -i "1i$timestamp | $action | $iccid | $info | $http_code" "$LOG_FILE"
+        done
+    fi
+}
+
+# Function to generate curl headers
+get_curl_headers() {
+    local method=$1
+    local headers=(
+        "--header \"accept: application/json\""
+        "--header \"authorization: Bearer $token\""
+    )
+    if [[ "$method" == "POST" ]]; then
+        headers+=("--header \"content-type: application/json\"")
+    fi
+    echo "${headers[*]}"
+}
+
+# Function to display usage
+usage() {
+    echo "Usage:
+ $0 [--option] [<argument(s)>]
+
+Options:"
+    echo " -T,  --get-token,                     Generate an API token (expiring after one hour)"
+    echo " -l,  --get-sims (<pages>),            List details of all SIM cards; optionally specify how many pages of 100 cards to retrieve"
+    echo " -L,  --get-sim <iccid>,               List details of a given SIM card"
+    echo " -S,  --get-status <iccid>             Fetch the status of a given SIM card, including connectivity and location details"
+    echo " -U,  --get-usage <iccid> (<interval>) Get daily usage for a given SIM card since 14 days (default)
+                                       Optionally specify an interval formatted as YYYY-MM-DD:YYYY-MM-DD, YYYY-MM-DD: (max 6 months
+                                       from start date), or :YYYY-MM-DD (max 6 months before end date)"
+    echo " -Q,  --get-quota <iccid>              Get remaining quota for a given SIM card"
+    echo " -E,  --get-events <iccid> (<page>)    Fetch events for a SIM card; optionally specify a page number"
+    echo " -C,  --get-connectivity <iccid>       Fetch connectivity info for a SIM card"
+    echo " -R,  --reset-connectivity <iccid>     Trigger a connectivity reset for a given SIM; the actual reset will be done asynchronously"
+    echo " -la, --label <iccid(s)> <label(s)>    Set label(s) for one or more SIM cards (provide ICCIDs and labels as comma-separated lists)"
+    echo " -e,  --enable <iccid(s)>              Enable one or more SIM card(s) (provide ICCIDs as a comma-separated list)"
+    echo " -d,  --disable <iccid(s)>             Disable one or more SIM card(s) (provide ICCIDs as a comma-separated list)"
+    echo " -il, --imei-lock <iccid(s)>           Lock the IMEI for one or more SIM card(s) (provide ICCIDs as a comma-separated list)"
+    echo " -iu, --imei-unlock <iccid(s)>         Unlock the IMEI for one or more SIM card(s) (provide ICCIDs as a comma-separated list)"
+    exit 1
+}
+
+# Function to check for required dependencies
+check_dependencies() {
+    local missing_deps=()
+
+    if ! command -v bat &> /dev/null && ! command -v batcat &> /dev/null; then
+        missing_deps+=("bat (batcat on Debian)")
+    fi
+
+    if ! command -v jq &> /dev/null; then
+        missing_deps+=("jq")
+    fi
+
+    if ! command -v curl &> /dev/null; then
+        missing_deps+=("curl")
+    fi
+
+    if ! command -v awk &> /dev/null; then
+        missing_deps+=("awk")
+    fi
+
+    # If any dependencies are missing, print an error and exit
+    if [ ${#missing_deps[@]} -gt 0 ]; then
+        printf "Please install missing dependencies and try again:"
+        printf " %s," "${missing_deps[@]}" | sed 's/,$//'
+        printf "\n"
+        exit 1
+    fi
+}
+
+# Function to get the access token
+get_token() {
+    read -e -p "Enter your username: " username
+    read -s -p "Enter your password: " password
+    echo  # Add a newline after the password prompt
+
+    # Encode the username and password in Base64
+    credentials=$(echo -n "$username:$password" | base64)
+
+    printf "Fetching access token from 1nce.com API… "
+    response=$(curl -s --request POST \
+        --url https://api.1nce.com/management-api/oauth/token \
+        --header 'accept: application/json' \
+        --header "authorization: Basic $credentials" \
+        --header 'content-type: application/json' \
+        --data '{"grant_type": "client_credentials"}')
+
+    # Extract the token from the response
+    token=$(echo "$response" | jq -r '.access_token')
+    http_code=$(echo "$response" | jq -r '.statusCode')
+    http_message=$(echo "$response" | jq -r '.message')
+
+    if [ -z "$token" ] || [ "$token" == "null" ]; then
+	handle_http_response "$http_code" "$http_message" "get-token" "NA"
+	echo -e "($http_message)"
+        exit 1
+    else
+	handle_http_response "200" "Token retrieved successfully" "get-token" "NA"
+        echo "$token" > "$TOKEN_FILE"
+        echo "Token stored in $TOKEN_FILE."
+    fi
+}
+
+# Function to check if a token exists and is not expired
+check_token() {
+    if [ ! -f "$TOKEN_FILE" ]; then
+        echo "Warning: No token found. Please run --get-token first."
+        exit 1
+    fi
+
+    # Check if the token is older than 3600 seconds (1 hour)
+    local token_age=$(($(date +%s) - $(date -r "$TOKEN_FILE" +%s)))
+    if [ "$token_age" -gt 3600 ]; then
+        echo "Warning: Token has expired. Please run --get-token to generate a new one."
+        exit 1
+    fi
+
+    token=$(cat "$TOKEN_FILE")
+}
+
+# Function to validate date format (yyyy-mm-dd)
+validate_date() {
+    if [[ ! $1 =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+        echo "Error: Invalid date format. Use yyyy-mm-dd."
+        exit 1
+    fi
+}
+
+# Function to calculate date offset
+calculate_date() {
+    local date=$1
+    local offset=$2
+    date -d "$date $offset days" +%Y-%m-%d
+}
+
+# Function to calculate the difference in days between two dates
+date_diff() {
+    local start=$1
+    local end=$2
+    echo $(( ($(date -d "$end" +%s) - $(date -d "$start" +%s)) / 86400 ))
+}
+
+# Function to format output using bat/batcat
+format_output() {
+    local input=$(cat)  # Read entire stdin into 'input'
+    
+    if [ -z "$input" ]; then
+        echo "No data found."
+        return
+    fi
+    
+    echo "$input" | column -t -s $'\t' -o $'  ' | $BAT_CMD --number \
+        --color=always \
+        --paging=auto \
+        --highlight-line=1:2 \
+        --chop-long-lines
+}
+
+# Function to build JSON payload for SIM updates
+build_json_payload() {
+    local iccids=$1
+    local key=$2
+    local value=$3
+
+    IFS=',' read -r -a iccid_array <<< "$iccids"
+    local json_payload="["
+    for ((i=0; i<${#iccid_array[@]}; i++)); do
+        # Fetch the current state of the SIM card
+        local cmd="curl -s --request GET --url \"https://api.1nce.com/management-api/v1/sims/${iccid_array[$i]}\" $(get_curl_headers "GET")"
+        local current_state=$(eval $cmd)
+
+        # Check if the current state was fetched successfully
+        if echo "$current_state" | jq -e '.error' > /dev/null; then
+            echo "Error: Failed to fetch current state for ICCID ${iccid_array[$i]}."
+            exit 1
+        fi
+
+        # Extract required fields from the current state
+        local iccid=$(echo "$current_state" | jq -r '.iccid')
+        local imei_lock=$(echo "$current_state" | jq -r '.imei_lock')
+        local status=$(echo "$current_state" | jq -r '.status')
+        local label=$(echo "$current_state" | jq -r '.label')
+
+        # Update the specified key with the new value
+        case "$key" in
+            "imei_lock") imei_lock="$value" ;;
+            "status") status="$value" ;;
+            "label") label="$value" ;;
+            *) echo "Error: Invalid key '$key'."; exit 1 ;;
+        esac
+
+        # Construct the JSON object for this SIM card
+        json_payload+="{\"iccid\": \"$iccid\", \"imei_lock\": $imei_lock, \"status\": \"$status\", \"label\": \"$label\"}"
+
+        # Add a comma if this is not the last SIM card
+        if [ $i -lt $((${#iccid_array[@]} - 1)) ]; then
+            json_payload+=","
+        fi
+    done
+    json_payload+="]"
+    echo "$json_payload"
+}
+
+# Function to handle HTTP responses
+handle_http_response() {
+    local response=$1
+    local message=$2
+    local action=$3
+    local iccids=$4
+
+    if [ "$response" -eq 201 ] || [ "$response" -eq 200 ]; then
+        echo "$message."
+        log_action "$action" "$iccids" "$message" "$response"
+    elif [ "$response" -lt 200 ]; then
+        if [[ "$action" = get-sim* ]]; then # Avoid printing the message when using get-sim and more specifically get-sims because it shows in each page of the pager.
+            log_action "$action" "$iccids" "$message" "$response"
+	else
+	    echo "$message."
+	    log_action "$action" "$iccids" "$message" "$response"
+	fi
+    else
+        echo "Error: HTTP status code: $response"
+        log_action "$action" "$iccids" "Failure" "$response"
+    fi
+}
+
+# Function to get SIM connectivity information
+get_connectivity() {
+    check_token
+
+    local iccid=$1
+    if [ -z "$iccid" ]; then
+        echo "Error: ICCID is required for --get-connectivity."
+        exit 1
+    fi
+
+    printf "Fetching connectivity info for ICCID: $iccid… "
+
+    local cmd="curl -s --request GET --url \"https://api.1nce.com/management-api/v1/sims/$iccid/connectivity_info?subscriber=true&ussd=false\" $(get_curl_headers "GET")"
+    response=$(eval $cmd)
+
+    # Check if the response contains an error and log
+    if echo "$response" | jq -e '.message' > /dev/null; then
+        http_message="$(echo "$response" | jq -r '.message')"
+	handle_http_response "0" "$http_message" "get-connectivity" "$iccid"
+        exit 1
+    fi
+    handle_http_response "0" "Done" "get-connectivity" "$iccid"
+    
+    # Parse and format the response
+    echo "$response" | jq -r '([
+        "Subscriber success",
+        "Subscriber error",
+        "Request timestamp",
+        "Reply timestamp"
+    ] | (., map(length*"-"))),
+    ([
+        .subscriber_info.success // "NA",
+        .subscriber_info.error // "NA",
+        .request_timestamp // "NA",
+        .reply_timestamp // "NA"
+    ]) | @tsv' | format_output
+}
+
+# Function to reset SIM connectivity
+reset_connectivity() {
+    check_token
+
+    local iccid=$1
+    if [ -z "$iccid" ]; then
+        echo "Error: ICCID is required for --reset-connectivity."
+        exit 1
+    fi
+
+    printf "Triggering connectivity reset for ICCID: $iccid… "
+
+    local cmd="curl -s -o /dev/null -w \"%{http_code}\" --request POST \
+        --url \"https://api.1nce.com/management-api/v1/sims/$iccid/reset\" \
+        $(get_curl_headers "POST")"
+    response=$(eval $cmd)
+
+    handle_http_response "$response" "Connectivity reset successfully placed into the queue. This will be done asynchronously" "reset-connectivity" "$iccid"
+}
+
+# Function to fetch SIM events
+get_events() {
+    check_token
+
+    local iccid=$1
+    if [ -z "$iccid" ]; then
+        echo "Error: ICCID is required for --get-events."
+        exit 1
+    fi
+
+    local page=${2:-1}  # Default to page 1 if not provided
+    if [ "$page" -lt 1 ]; then
+        echo "Error: Page number must be greater than or equal to 1."
+        exit 1
+    fi
+
+    printf "Fetching events for ICCID: $iccid (page $page)… "
+
+    local cmd="curl -s --request GET --url \"https://api.1nce.com/management-api/v1/sims/$iccid/events?page=$page&pageSize=1000&sort=-timestamp%2C-id\" $(get_curl_headers "GET")"
+    response=$(eval $cmd)
+
+    # Check if the response contains an error and log
+    if echo "$response" | jq -e '.message' > /dev/null; then
+        http_message="$(echo "$response" | jq -r '.message')"
+	handle_http_response "0" "$http_message" "get-events" "$iccid"
+        exit 1
+    fi
+    handle_http_response "0" "Done" "get-events" "$iccid"
+
+    # Parse and format the response
+    echo "$response" | jq -r '([
+        "Timestamp",
+        "Event type",
+        "ICCID",
+        "IMEI",
+        "ICCID",
+        "Country",
+        "Operator",
+        "MCC",
+        "MNC",
+        "Alert",
+        "Event severity"
+    ] | (., map(length*"-"))),
+    (.events[] | [
+        .timestamp,
+        .event_type,
+        .iccid,
+        .imei,
+        .imsi,
+        .country,
+        .operator,
+        .mcc // "NA",
+        .mnc // "NA",
+        .alert,
+        .event_severity
+    ]) | @tsv' | format_output
+}
+
+# Function to fetch and display SIM data in TSV format
+get_sims() {
+    check_token
+
+    # Set default number of pages to 1
+    local pages=${1:-1}
+    if [ "$pages" -lt 1 ] || [ "$pages" -gt 10 ]; then
+        echo "Error: Number of pages must be between 1 and 10."
+        exit 1
+    fi
+
+    echo -e "Fetching $pages page(s)… "
+
+    # Fetch data for each page
+    for ((page=1; page<=pages; page++)); do
+        local cmd="curl -s --request GET --url \"https://api.1nce.com/management-api/v1/sims?page=$page&pageSize=100\" $(get_curl_headers "GET")"
+        response=$(eval $cmd)
+
+	handle_http_response "$page" "Done" "get-sims" "All" ### FIX
+
+	# Parse and format the response as TSV
+        if [ "$page" -eq 1 ]; then
+            # Print header and data for the first page
+            echo "$response" | jq -r '([
+                "Label",
+		"ICCID",
+                "IMSI",
+                "MSISDN",
+                "IMEI",
+                "IMEI lock",
+                "Status",
+                "Activation date",
+                "IP",
+                "Quota",
+                "Quota status",
+                "SMS quota",
+                "SMS quota status"] | (., map(length*"-"))),
+                (.[] | [
+		.label,
+                .iccid,
+                .imsi,
+                .msisdn,
+                .imei // "NA",
+                .imei_lock,
+                .status,
+                .activation_date,
+                .ip_address // "NA",
+                .current_quota,
+                .quota_status.description,
+                .current_quota_SMS,
+                .quota_status_SMS.description
+            ]) | @tsv'
+        else
+            # Print only data for subsequent pages
+            echo "$response" | jq -r '.[] | [
+                .label,
+		.iccid,
+                .imsi,
+                .msisdn,
+                .imei // "NA",
+                .imei_lock,
+                .status,
+                .activation_date,
+                .ip_address // "NA",
+                .current_quota,
+                .quota_status.description,
+                .current_quota_SMS,
+                .quota_status_SMS.description
+            ] | @tsv'
+        fi
+    done | awk 'NR<=2; NR>2 {print | "sort"}' | column -t -s $'\t' -o $'  ' | $BAT_CMD --number \
+        --color=always \
+        --paging=auto \
+        --highlight-line=1:2 \
+        --chop-long-lines
+}
+
+# Function to fetch details for a specific SIM card
+get_sim() {
+    check_token
+
+    local iccid=$1
+    if [ -z "$iccid" ]; then
+        echo "Error: ICCID is required for --get-sim."
+        exit 1
+    fi
+
+    printf "Fetching details for ICCID: $iccid… "
+
+    local cmd="curl -s --request GET --url \"https://api.1nce.com/management-api/v1/sims/$iccid\" $(get_curl_headers "GET")"
+    response=$(eval $cmd)
+
+    # Check if the response contains an error and log
+    if echo "$response" | jq -e '.message' > /dev/null; then
+        http_message="$(echo "$response" | jq -r '.message')"
+	handle_http_response "0" "$http_message" "get-sim" "$iccid"
+        exit 1
+    fi
+    handle_http_response "0" "Done" "get-sim" "$iccid"
+
+    # Parse and format the response
+    echo "$response" | jq -r '([
+        "Label",
+	"ICCID",
+        "IMSI",
+        "MSISDN",
+        "IMEI",
+        "IMEI lock",
+        "Status",
+        "Activation date",
+        "IP",
+        "Quota",
+        "Quota status",
+        "SMS quota",
+        "SMS quota status"
+    ] | (., map(length*"-"))),
+    ([
+        .label,
+	.iccid,
+        .imsi,
+        .msisdn,
+        .imei // "NA",
+        .imei_lock,
+        .status,
+        .activation_date,
+        .ip_address // "NA",
+        .current_quota,
+        .quota_status.description,
+        .current_quota_SMS,
+        .quota_status_SMS.description
+    ]) | @tsv' | format_output
+}
+
+get_usage() {
+    check_token
+
+    local iccid=$1
+    if [ -z "$iccid" ]; then
+        echo "Error: ICCID is required for --get-usage."
+        exit 1
+    fi
+
+    local date_range=$2
+    local startdate enddate currentdate
+
+    currentdate=$(date +%Y-%m-%d)
+
+    # Default to last 14 days if no date range is provided
+    if [ -z "$date_range" ]; then
+        enddate=$currentdate
+        startdate=$(calculate_date "$enddate" -14)
+    else
+        # Parse startdate and enddate from the range
+        IFS=':' read -r startdate enddate <<< "$date_range"
+
+        # Handle cases where only one date is provided
+        if [ -z "$startdate" ]; then
+            # Only enddate is provided: fetch 6 months before enddate
+            validate_date "$enddate"
+            startdate=$(calculate_date "$enddate" -180)
+        elif [ -z "$enddate" ]; then
+            # Only startdate is provided: fetch until current date
+            validate_date "$startdate"
+            enddate=$currentdate
+        else
+            # Both startdate and enddate are provided
+            validate_date "$startdate"
+            validate_date "$enddate"
+        fi
+
+        # Ensure enddate is later than startdate
+        if [[ "$startdate" > "$enddate" ]]; then
+            echo "Error: enddate must be later than startdate."
+            exit 1
+        fi
+    fi
+
+    # Truncate enddate to the current date if it exceeds it
+    if [[ "$enddate" > "$currentdate" ]]; then
+        enddate=$currentdate
+        echo "Warning: enddate exceeds the current date. Truncating to $currentdate."
+    fi
+
+    # Check if the date range exceeds 6 months (180 days)
+    local diff=$(date_diff "$startdate" "$enddate")
+    if [ "$diff" -gt 180 ]; then
+        echo "Warning: The API only allows listing up to 6 months of data. Adjusting the range to the last 6 months before $enddate."
+        startdate=$(calculate_date "$enddate" -180)
+    fi
+
+    printf "Fetching usage data for ICCID: $iccid from $startdate to $enddate… "
+
+    local cmd="curl -s --request GET --url \"https://api.1nce.com/management-api/v1/sims/$iccid/usage?start_dt=$startdate&end_dt=$enddate\" $(get_curl_headers "GET")"
+    response=$(eval $cmd)
+
+    # Check if the response contains an error and log
+    if echo "$response" | jq -e '.message' > /dev/null; then
+        http_message="$(echo "$response" | jq -r '.message')"
+	handle_http_response "0" "$http_message" "get-usage" "$iccid"
+        exit 1
+    fi
+    handle_http_response "0" "Done" "get-usage" "$iccid"
+
+
+    # Parse and format the response (distinguish TX and RX volumes)
+    echo "$response" | jq -r '([
+        "Date",
+        "TX (MB)",
+        "RX (MB)",
+        "SMS"
+    ] | (., map(length*"-"))),
+    (.stats[] | [
+        .date,
+        (.data.volume_tx // "NA"),
+        (.data.volume_rx // "NA"),
+        (.sms.volume // "NA")
+    ]) | @tsv' | format_output
+}
+
+# Function to fetch SIM data quota
+get_quota() {
+    check_token
+
+    local iccid=$1
+    if [ -z "$iccid" ]; then
+        echo "Error: ICCID is required for --get-quota."
+        exit 1
+    fi
+
+    printf "Fetching data quota for ICCID: $iccid… "
+
+    local cmd="curl -s --request GET --url \"https://api.1nce.com/management-api/v1/sims/$iccid/quota/data\" $(get_curl_headers "GET")"
+    response=$(eval $cmd)
+
+    # Check if the response contains an error and log
+    if echo "$response" | jq -e '.message' > /dev/null; then
+        http_message="$(echo "$response" | jq -r '.message')"
+	handle_http_response "0" "$http_message" "get-quota" "$iccid"
+        exit 1
+    fi
+    handle_http_response "0" "Done" "get-quota" "$iccid"
+
+    # Parse and format the response
+    echo "$response" | jq -r '([
+        "Volume (MB)",
+        "Total volume (MB)",
+        "Expiry date",
+        "Peak throughput (kbps)",
+        "Last volume added (MB)",
+        "Last status change date",
+        "Threshold (%)"
+    ] | (., map(length*"-"))),
+    ([
+        .volume,
+        .total_volume,
+        .expiry_date,
+        .peak_throughput,
+        .last_volume_added,
+        .last_status_change_date,
+        .threshold_percentage
+    ]) | @tsv' | format_output
+}
+
+# Function to fetch SIM status
+get_status() {
+    check_token
+
+    local iccid=$1
+    if [ -z "$iccid" ]; then
+        echo "Error: ICCID is required for --get-status."
+        exit 1
+    fi
+
+    printf "Fetching status for ICCID: $iccid… "
+
+    local cmd="curl -s --request GET --url \"https://api.1nce.com/management-api/v1/sims/$iccid/status\" $(get_curl_headers "GET")"
+    response=$(eval $cmd)
+
+    # Check if the response contains an error and log
+    if echo "$response" | jq -e '.message' > /dev/null; then
+        http_message="$(echo "$response" | jq -r '.message')"
+	handle_http_response "0" "$http_message" "get-status" "$iccid"
+        exit 1
+    fi
+    handle_http_response "0" "Done" "get-status" "$iccid"
+
+    # Parse and format the response
+    echo "$response" | jq -r '([
+        "Status",
+        "Services",
+        "Last updated",
+        "Operator",
+        "Operator id",
+        "Country",
+        "Country id",
+        "Country code",
+        "Latitude",
+        "Longitude"
+    ] | (., map(length*"-"))),
+    ([
+        .status,
+        (.services | join(", ")),
+        .location.last_updated // "NA",
+        .location.operator.name // "NA",
+        .location.operator.id // "NA",
+        .location.country.name // "NA",
+        .location.country.country_id // "NA",
+        .location.country.country_code // "NA",
+        .location.country.latitude // "NA",
+        .location.country.longitude // "NA"
+    ]) | @tsv' | format_output
+}
+
+# Function to update SIM labels
+label_sims() {
+    check_token
+
+    local iccids=$1
+    local labels=$2
+
+    if [ -z "$iccids" ] || [ -z "$labels" ]; then
+        echo "Error: ICCIDs and labels are required for --label."
+        exit 1
+    fi
+
+    IFS=',' read -r -a iccid_array <<< "$iccids"
+    IFS=',' read -r -a label_array <<< "$labels"
+
+    if [ ${#iccid_array[@]} -ne ${#label_array[@]} ]; then
+        echo "Error: The number of ICCIDs must match the number of labels."
+        exit 1
+    fi
+
+    declare -a old_labels
+    local json_payload="["
+
+    for i in "${!iccid_array[@]}"; do
+        local cmd="curl -s --request GET --url \"https://api.1nce.com/management-api/v1/sims/${iccid_array[$i]}\" $(get_curl_headers "GET")"
+        local current_state=$(eval $cmd)
+
+        if echo "$current_state" | jq -e '.error' > /dev/null; then
+            echo "Error: Failed to fetch current state for ICCID ${iccid_array[$i]}."
+            old_labels[$i]="UNKNOWN"
+        else
+            old_labels[$i]=$(echo "$current_state" | jq -r '.label')
+        fi
+
+        json_payload+="{\"iccid\": \"${iccid_array[$i]}\", \"label\": \"${label_array[$i]}\"}"
+        [ $i -lt $((${#iccid_array[@]} - 1)) ] && json_payload+=","
+    done
+
+    json_payload+="]"
+
+    printf "Updating labels for ICCIDs: $iccids… "
+
+    local cmd="curl -s -o /dev/null -w \"%{http_code}\" --request POST \
+        --url \"https://api.1nce.com/management-api/v1/sims\" \
+        $(get_curl_headers "POST") \
+        --data '$json_payload'"
+    response=$(eval $cmd)
+
+    if [ "$response" -eq 201 ]; then
+        echo "Labels updated successfully."
+        for i in "${!iccid_array[@]}"; do
+            log_action "label" "${iccid_array[$i]}" "${label_array[$i]} (was: ${old_labels[$i]:-UNKNOWN})" "$response"
+        done
+    else
+        echo "Error: HTTP status code: $response"
+        for i in "${!iccid_array[@]}"; do
+            log_action "label" "${iccid_array[$i]}" "Failed to update label" "$response"
+        done
+        exit 1
+    fi
+}
+
+# Function to enable SIMs
+enable_sims() {
+    check_token
+    local iccids=$1
+    local json_payload=$(build_json_payload "$iccids" "status" "Enabled")
+    
+    printf "Enabling ICCIDs: $iccids… "
+
+    local cmd="curl -s -o /dev/null -w \"%{http_code}\" --request POST \
+        --url \"https://api.1nce.com/management-api/v1/sims\" \
+	$(get_curl_headers "POST") \
+        --data '$json_payload'"
+    response=$(eval $cmd)
+
+    handle_http_response "$response" "Activation request successfully sent" "enable" "$iccids"
+}
+
+# Function to disable SIMs
+disable_sims() {
+    check_token
+    local iccids=$1
+    local json_payload=$(build_json_payload "$iccids" "status" "Disabled")
+    
+    printf "Disabling ICCIDs: $iccids… "
+
+    local cmd="curl -s -o /dev/null -w \"%{http_code}\" --request POST \
+        --url \"https://api.1nce.com/management-api/v1/sims\" \
+	$(get_curl_headers "POST") \
+        --data '$json_payload'"
+    response=$(eval $cmd)
+
+    handle_http_response "$response" "Deactivation request successfully sent" "disable" "$iccids"
+}
+
+# Function to lock IMEI for SIMs
+imei_lock_sims() {
+    check_token
+    local iccids=$1
+    local json_payload=$(build_json_payload "$iccids" "imei_lock" "true")
+    
+    printf "Locking IMEI for ICCIDs: $iccids… "
+
+    local cmd="curl -s -o /dev/null -w \"%{http_code}\" --request POST \
+        --url \"https://api.1nce.com/management-api/v1/sims\" \
+	$(get_curl_headers "POST") \
+        --data '$json_payload'"
+    response=$(eval $cmd)
+
+    handle_http_response "$response" "IMEI lock request successfully sent" "imei-lock" "$iccids"
+}
+
+# Function to unlock IMEI for SIMs
+imei_unlock_sims() {
+    check_token
+    local iccids=$1
+    local json_payload=$(build_json_payload "$iccids" "imei_lock" "false")
+    
+    printf "Unlocking IMEI for ICCIDs: $iccids… "
+
+    local cmd="curl -s -o /dev/null -w \"%{http_code}\" --request POST \
+        --url \"https://api.1nce.com/management-api/v1/sims\" \
+	$(get_curl_headers "POST") \
+        --data '$json_payload'"
+    response=$(eval $cmd)
+
+    handle_http_response "$response" "IMEI unlock request successfully sent" "imei-unlock" "$iccids"
+}
+
+# Main script logic
+check_dependencies
+
+if [ $# -eq 0 ]; then
+    usage
+fi
+
+case "$1" in
+    --get-token|-T) get_token ;;
+    --get-sims|-l) pages=${2:-1}; get_sims "$pages" ;;
+    --get-sim|-L) iccid=$2; get_sim "$iccid" ;;
+    --get-status|-S) iccid=$2; get_status "$iccid" ;;
+    --get-usage|-U) iccid=$2; date_range=$3; get_usage "$iccid" "$date_range" ;;
+    --get-quota|-Q) iccid=$2; get_quota "$iccid" ;;
+    --get-events|-E) iccid=$2; page=${3:-1}; get_events "$iccid" "$page" ;;
+    --get-connectivity|-C) iccid=$2; get_connectivity "$iccid" ;;
+    --reset-connectivity|-R) iccid=$2; reset_connectivity "$iccid" ;;
+    --label|-la) iccids=$2; labels=$3; label_sims "$iccids" "$labels" ;;
+    --enable|-e) iccids=$2; enable_sims "$iccids" ;;
+    --disable|-d) iccids=$2; disable_sims "$iccids" ;;
+    --imei-lock|-il) iccids=$2; imei_lock_sims "$iccids" ;;
+    --imei-unlock|-iu) iccids=$2; imei_unlock_sims "$iccids" ;;
+    *) usage ;;
+esac
