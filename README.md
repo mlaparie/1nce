@@ -106,7 +106,7 @@ For additional resources and API documentation, refer to the [1NCE Developer Hub
    ```
 
 ## Logging
-All actions are logged in the `1nce.log` file, which includes timestamps, actions (including tracking label changes)), ICCIDs, and HTTP response codes.
+All actions are logged in the `1nce.log` file, which includes timestamps, actions (including tracking label changes), ICCIDs, and HTTP response codes.
 
 ```
 2025-02-14 01:10:04 | enable | 987654321098765432 | Activation request successfully sent | 201
