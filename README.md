@@ -25,11 +25,12 @@ For additional resources and API documentation, refer to the [1NCE Developer Hub
   - `bat` or `batcat`
   - `awk`
 - **1NCE API access**: you need a valid 1NCE customer account to use the API.
+- Clone this repository or download the script, and make it executable.
 
 ## Usage
 
 ```bash
-./1nce_script.sh [--option] [<argument(s)>]
+./1nce [--option] [<argument(s)>]
 ```
 
 ### Options
